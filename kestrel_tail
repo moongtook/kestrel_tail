@@ -1,0 +1,427 @@
+#!/usr/bin/env python
+
+"""
+kestrel_tail: A simple script for sending messages to kestrel.
+"""
+
+import os, sys, time
+import re
+import argparse
+import threading
+import Queue
+import kestrel
+import random
+import logging
+import logging.handlers
+import traceback
+
+# For pretty log messages, if available
+try:
+    import curses
+except:
+    curses = None
+
+
+class _LogFormatter(logging.Formatter):
+    def __init__(self, color, *args, **kwargs):
+        logging.Formatter.__init__(self, *args, **kwargs)
+        self._color = color
+        if color:
+            fg_color = curses.tigetstr("setaf") or curses.tigetstr("setf") or ""
+            self._colors = {
+                logging.DEBUG: curses.tparm(fg_color, 4), # Blue
+                logging.INFO: curses.tparm(fg_color, 2), # Green
+                logging.WARNING: curses.tparm(fg_color, 3), # Yellow
+                logging.ERROR: curses.tparm(fg_color, 1), # Red
+            }
+            self._normal = curses.tigetstr("sgr0")
+
+    def format(self, record):
+        try:
+            record.message = record.getMessage()
+        except Exception, e:
+            record.message = "Bad message (%r): %r" % (e, record.__dict__)
+        record.asctime = time.strftime(
+            "%y%m%d %H:%M:%S", self.converter(record.created))
+        prefix = '[%(levelname)1.1s %(asctime)s %(module)s:%(lineno)d]' % \
+            record.__dict__
+        if self._color:
+            prefix = (self._colors.get(record.levelno, self._normal) +
+                      prefix + self._normal)
+        formatted = prefix + " " + record.message
+        if record.exc_info:
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            formatted = formatted.rstrip() + "\n" + record.exc_text
+        return formatted.replace("\n", "\n    ")
+
+
+def pretty_logging(log_file_path, log_level):
+    """Turns on formatted logging output as configured."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper()))
+    if log_file_path:
+        channel = logging.handlers.TimedRotatingFileHandler(
+                log_file_path,
+                when='D',
+                interval=1,
+                backupCount=3)
+        channel.setFormatter(_LogFormatter(color=False))
+        root_logger.addHandler(channel)
+    else:
+        # Set up color if we are in a tty and curses is installed
+        color = False
+        if curses and sys.stderr.isatty():
+            try:
+                curses.setupterm()
+                if curses.tigetnum("colors") > 0:
+                    color = True
+            except:
+                pass
+        channel = logging.StreamHandler()
+        channel.setFormatter(_LogFormatter(color=color))
+        root_logger.addHandler(channel)
+
+
+
+class Tailer(object):
+    """\
+    Implements tailing functionality like GNU tail commands.
+
+    Based on: http://pypi.python.org/pypi/tailer
+    """
+    line_terminators = ('\r\n', '\n', '\r')
+
+    def __init__(self, file):
+        self.file = file
+        self.start_pos = self.file.tell()
+
+    def seek(self, pos, whence=0):
+        self.file.seek(pos, whence)
+
+    def time_is_up_to_flush(self, last, now, flush_interval):
+        return (now - last > flush_interval)
+
+    def follow(self, delay=1.0, flush_interval=3.0, start=None):
+        """\
+        Iterator generator that returns lines as data is added to the file.
+
+        Based on: http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/157035
+        """
+        trailing = True       
+        last_flush_time = time.time()
+
+        if start == None:
+            with_start = False
+        else:
+            with_start = True
+
+        while 1:
+
+            if with_start:
+                whence = start
+                with_start = False
+            else:
+                whence = self.file.tell()
+
+            self.seek(whence)
+                
+            line = self.file.readline()
+            if line:    
+                if trailing and line in self.line_terminators:
+                    # This is just the line terminator added to the end of the
+                    # file before a new line, ignore.
+                    trailing = False
+                    continue
+
+                if line[-1] in self.line_terminators:
+                    line = line[:-1]
+                    if line[-1:] == '\r\n' and '\r\n' in self.line_terminators:
+                        # found crlf
+                        line = line[:-1]
+
+                trailing = False
+                next_whence = self.file.tell()
+                # flush, line, whence
+                yield False, line, next_whence
+            else:
+                trailing = True
+                self.seek(whence)
+
+                if self.time_is_up_to_flush(last_flush_time, time.time(),
+                        flush_interval):
+                    last_flush_time = time.time()
+                    # flush, line, whence
+                    yield True, None, None
+
+                time.sleep(delay)
+
+    def __iter__(self):
+        return self.follow()
+
+    def close(self):
+        self.file.close()
+
+
+
+class Kestrel(object):
+
+    def __init__(self, servers, queue=None):
+        self.clients = []
+        self.servers = servers
+        self.queue = queue
+        for s in self.servers:
+            self.clients.append(kestrel.Client([s]))
+
+    def add(self, message, queue=None):
+        c = self.clients[random.randrange(len(self.servers))]
+        if self.queue:
+            return c.add(self.queue, message)
+        return c.add(queue, message)
+
+    def __del__(self):
+        for c in self.clients:
+            c.close()
+
+
+
+class QueueRunner(threading.Thread):
+
+    def __init__(self, line_queue, kestrel, fail_store=None):
+        threading.Thread.__init__(self)
+        self.line_queue = line_queue
+        self.kestrel = kestrel
+        self.fail_store = fail_store
+
+    def run(self):
+        while True:
+            try:
+                line_queue = self.line_queue.get(True, 2)
+            except Queue.Empty:
+                pass
+            else:
+                if line_queue:
+                    if self.kestrel.add(line_queue):
+                        self.line_queue.task_done()
+                    else:
+                        logging.error("fail to adding to kestrel!!")
+                        if self.fail_store:
+                            logging.error("fail store is configured. so log will be stored to fail store.")
+                            fail_store.log(line_queue)
+                        else:
+                            logging.error("fail store is not configured. so log will be ignored.")
+
+
+
+class MonitorRunner(threading.Thread):
+
+    def __init__(self, line_queue, kestrel):
+        threading.Thread.__init__(self)
+        self.line_queue = line_queue
+        self.kestrel = kestrel
+
+    def run(self):
+        while True:
+            logging.info(">> queue size %s" % self.line_queue.qsize())
+            time.sleep(3)
+
+
+
+class FailStore(object):
+
+    def __init__(self, target_file=None, path=None, when='h', interval=1,
+            backup_count=5):
+        fail_store_filename = 'kestrel_tail_fail_store.log'
+        fail_store_full_path = None
+        if path:
+            fail_store_full_path = os.path.join(path, fail_store_filename)
+        else:
+            dir_of_target_file = os.path.dirname(
+                    os.path.abspath(target_file.name)) 
+            fail_store_full_path = os.path.join(dir_of_target_file,
+                    fail_store_filename)
+
+
+        self.logger = logging.getLogger('KestrelTailFailStore')
+        self.logger.setLevel(logging.ERROR)
+
+        formatter = logging.Formatter('%(message)s')
+        handler = logging.handlers.TimedRotatingFileHandler(
+                fail_store_full_path, when=when, interval=interval,
+                backupCount=backup_count)
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+
+    def log(self, msg):
+        self.logger.error(msg)
+
+
+
+class WhenceStore(object):
+
+    def __init__(self, target_file, rewind=False):
+        self.whence_file_name = target_file.name + '.kestrel_tail_whence'
+        if not self.exists():
+            self.touch()
+        self.f = open(self.whence_file_name, 'r+')
+        if rewind:
+            self.whence(0)
+
+    def touch(self):
+        open(self.whence_file_name, 'w').close()
+
+    def exists(self):
+        return os.path.exists(self.whence_file_name)
+
+    def whence_file_ready(self):
+        return (self.f and not self.f.closed)
+
+    def start(self):
+        if self.whence_file_ready():
+            self.f.seek(0)
+            start = self.f.read().strip()
+            if start == "":
+                return None
+            else:
+                return int(start)
+        else:
+            return None
+
+    def whence(self, whence):
+        assert type(whence) in (int, long), 'whence must be int or long'
+        if self.whence_file_ready():
+            self.f.seek(0)
+            self.f.write(str(whence))
+            self.f.truncate()
+            self.f.flush()
+
+    def __del__(self):
+        self.f.close()
+
+
+
+def follow(line_queue, target_file, delay=1.0, flush_interval=0.0,
+        read_line_buf_size=0, whence_store=None):
+
+    read_line_buf = []
+
+    tailer = Tailer(target_file)
+    
+    for time_to_flush, line, whence in tailer.follow(delay, flush_interval,
+            whence_store.start()):
+
+        if time_to_flush:
+            if len(read_line_buf) != 0:
+                flush(read_line_buf, line_queue,
+                        whence_store=whence_store)
+        else:
+            read_line_buf.append((line, whence))
+            if len(read_line_buf) >= read_line_buf_size:
+                flush(read_line_buf, line_queue,
+                        whence_store=whence_store)
+
+
+
+def flush(lines, line_queue, whence_store=None):
+
+    whence_store.whence(lines[-1][1])
+
+    for l in lines:
+        line_queue.put(l[0])
+
+    del lines[:]
+
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog='kestrel_tail',
+            description='Follow file and send data to kestrel.')
+    parser.add_argument('FILE', metavar='FILE', type=file, nargs=1,
+            help='target file name')
+    parser.add_argument('-v', '--version', action='version',
+            version='%(prog)s 0.1')
+    parser.add_argument('-q', '--queue', required=True,
+            help='queue name')
+    parser.add_argument('-n', '--num_threads', type=int, default=10,
+            help='number of worker threads')
+    parser.add_argument('-l', '--host_ports', nargs='*', default=['127.0.0.1:22113'],
+            help='ketrel host:port pairs (default: 127.0.0.1:22113)'
+                'ex) -l myhost1:port myhost2:port')
+    parser.add_argument('--rewind', type=bool, default=False,
+            help='start read the file from the beginning (default: false)')
+    parser.add_argument('--follow_delay', type=float, default=0.5,
+            help='follow file delay(Sec) (default: 0.5)')
+    parser.add_argument('--read_line_buf_size', type=int, default=0,
+            help='read line buffer size (default: 0)')
+    parser.add_argument('--flush_interval', type=float, default=0.0,
+            help='flush read line buffer interval(Sec) (default: 0.0)')
+    parser.add_argument('--fail_store_path',
+            help='store path to write kestrel send failed data '
+                '(default: same with FILE\'s directory)')
+    parser.add_argument('--fail_store_log_rotate_when',
+            choices=['S', 'M', 'H', 'D', 'W', 'midnight'], default='H',
+            help='fail store log rotate when '
+                'depending on the rollover interval (default: H). '
+                'for more information, visit http://docs.python.org/library/logging.handlers.html#timedrotatingfilehandler')
+    parser.add_argument('--fail_store_log_rotate_rollover_interval', type=int,
+            default=1, help='fail store log rotate rollover interval'
+                '(default: 1)')
+    parser.add_argument('--fail_store_backup_count', type=int, default=5,
+            help='fail store file backup count (default: 5)')
+    parser.add_argument('-lv', '--log_level', default='ERROR',
+            help='logging level(default: ERROR)')
+    parser.add_argument('-lp', '--log_file_path', required=False,
+            help='log file path. if not given, stderr will be used.')
+    return parser.parse_args()
+
+
+def main():
+
+    args = parse_args()
+    target_file = args.FILE[0]
+
+    pretty_logging(args.log_file_path, args.log_level)
+
+    line_queue = Queue.Queue()
+
+    # Fail store
+    if (args.fail_store_path):
+        logging.debug("fail store path is %s" % args.fail_store_path)
+        fail_store = FailStore(target_file=target_file,
+                path=args.fail_store_path,
+                when=args.fail_store_log_rotate_when,
+                interval=args.fail_store_log_rotate_rollover_interval,
+                backup_count=args.fail_store_backup_count)
+    else:
+        logging.debug("fail store path is not given. failed log will be ignored ")
+        fail_store = None
+
+    kes = lambda: Kestrel(args.host_ports, queue=args.queue)
+
+    # Spawn a pool of place worker threads
+    logging.debug("spawn <%s> kestrel client thread" % args.num_threads)
+    for i in range(args.num_threads):
+        p = QueueRunner(line_queue, kes(), fail_store=fail_store)
+        p.setDaemon(True)
+        p.start()
+
+    # Spawn monitor threads
+    p = MonitorRunner(line_queue, kes())
+    p.setDaemon(True)
+    p.start()
+
+    # Whence to start
+    whence_store = WhenceStore(target_file, rewind=args.rewind)
+
+    # Follow the file and send data to kestrel
+    follow(line_queue,
+            target_file,
+            delay=args.follow_delay,
+            flush_interval=args.flush_interval,
+            read_line_buf_size=args.read_line_buf_size,
+            whence_store=whence_store)
+
+
+if __name__ == "__main__":
+    main()
