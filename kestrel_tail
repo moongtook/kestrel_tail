@@ -95,7 +95,6 @@ class Tailer(object):
 
     def __init__(self, file):
         self.file = file
-        self.start_pos = self.file.tell()
 
     def seek(self, pos, whence=0):
         self.file.seek(pos, whence)
@@ -103,7 +102,7 @@ class Tailer(object):
     def time_is_up_to_flush(self, last, now, flush_interval):
         return (now - last > flush_interval)
 
-    def follow(self, delay=1.0, flush_interval=3.0, start=None):
+    def follow(self, delay=1.0, flush_interval=3.0, whence_store=None):
         """\
         Iterator generator that returns lines as data is added to the file.
 
@@ -112,20 +111,23 @@ class Tailer(object):
         trailing = True       
         last_flush_time = time.time()
 
-        if start == None:
-            with_start = False
-        else:
-            with_start = True
+        if whence_store:
+            start = whence_store.start()
+            if start == None:
+                with_start = False
+            else:
+                with_start = True
 
         while 1:
 
-            if with_start:
-                whence = start
-                with_start = False
-            else:
-                whence = self.file.tell()
+            if whence_store:
+                if with_start:
+                    whence = start
+                    with_start = False
+                else:
+                    whence = self.file.tell()
 
-            self.seek(whence)
+                self.seek(whence)
                 
             line = self.file.readline()
             if line:    
@@ -142,12 +144,16 @@ class Tailer(object):
                         line = line[:-1]
 
                 trailing = False
-                next_whence = self.file.tell()
+                if whence_store:
+                    next_whence = self.file.tell()
+                else:
+                    next_whence = None
                 # flush, line, whence
                 yield False, line, next_whence
             else:
                 trailing = True
-                self.seek(whence)
+                if whence_store:
+                    self.seek(whence)
 
                 if self.time_is_up_to_flush(last_flush_time, time.time(),
                         flush_interval):
@@ -309,7 +315,7 @@ def follow(line_queue, target_file, delay=1.0, flush_interval=0.0,
     tailer = Tailer(target_file)
     
     for time_to_flush, line, whence in tailer.follow(delay, flush_interval,
-            whence_store.start()):
+            whence_store):
 
         if time_to_flush:
             if len(read_line_buf) != 0:
@@ -325,7 +331,8 @@ def follow(line_queue, target_file, delay=1.0, flush_interval=0.0,
 
 def flush(lines, line_queue, whence_store=None):
 
-    whence_store.whence(lines[-1][1])
+    if whence_store:
+        whence_store.whence(lines[-1][1])
 
     for l in lines:
         line_queue.put(l[0])
@@ -337,10 +344,10 @@ def flush(lines, line_queue, whence_store=None):
 def parse_args():
     parser = argparse.ArgumentParser(prog='kestrel_tail',
             description='Follow file and send data to kestrel.')
-    parser.add_argument('FILE', metavar='FILE', type=file, nargs=1,
-            help='target file name')
     parser.add_argument('-v', '--version', action='version',
             version='%(prog)s 0.1')
+    parser.add_argument('FILE', nargs='?', type=argparse.FileType('r'), default = sys.stdin,
+            help='File to follow. if not given, use stdin.')
     parser.add_argument('-q', '--queue', required=True,
             help='queue name')
     parser.add_argument('-n', '--num_threads', type=int, default=10,
@@ -379,7 +386,8 @@ def parse_args():
 def main():
 
     args = parse_args()
-    target_file = args.FILE[0]
+    target_file = args.FILE
+    logging.debug("Start follow file: %s" % target_file.name)
 
     pretty_logging(args.log_file_path, args.log_level)
 
@@ -412,7 +420,10 @@ def main():
     p.start()
 
     # Whence to start
-    whence_store = WhenceStore(target_file, rewind=args.rewind)
+    if target_file.name == '<stdin>':
+        whence_store = None
+    else:
+        whence_store = WhenceStore(target_file, rewind=args.rewind)
 
     # Follow the file and send data to kestrel
     follow(line_queue,

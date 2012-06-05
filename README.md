@@ -1,7 +1,10 @@
-A simple script for sending messages to kestrel. this is working like tail commands.
+A simple script for sending messages to kestrel. this is working like tail commands. stdin also support! ;)
 
 # Usage
 
+    $ kestrel_tail --queue your_queue_name --host_ports kestrel_hosts1:22133 kestrel_hosts2:22133 --rewind true --num_threads 10 -lv DEBUG your_file_name
+
+    $ kestrel_tail --help
     usage: kestrel_tail [-h] [-v] -q QUEUE [-n NUM_THREADS]
                         [-l [HOST_PORTS [HOST_PORTS ...]]] [--rewind REWIND]
                         [--follow_delay FOLLOW_DELAY]
@@ -12,12 +15,12 @@ A simple script for sending messages to kestrel. this is working like tail comma
                         [--fail_store_log_rotate_rollover_interval FAIL_STORE_LOG_ROTATE_ROLLOVER_INTERVAL]
                         [--fail_store_backup_count FAIL_STORE_BACKUP_COUNT]
                         [-lv LOG_LEVEL] [-lp LOG_FILE_PATH]
-                        FILE
+                        [FILE]
 
     Follow file and send data to kestrel.
 
     positional arguments:
-      FILE                  target file name
+      FILE                  File to follow. if not given, use stdin.
 
     optional arguments:
       -h, --help            show this help message and exit
@@ -54,4 +57,3 @@ A simple script for sending messages to kestrel. this is working like tail comma
       -lp LOG_FILE_PATH, --log_file_path LOG_FILE_PATH
                             log file path. if not given, stderr will be used.
 
-    $ kestrel_tail --queue your_queue_name --host_ports kestrel_hosts1:22133 kestrel_hosts2:22133 --rewind true --num_threads 10 -lv DEBUG your_file_name
