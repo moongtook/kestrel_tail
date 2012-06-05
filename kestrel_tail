@@ -60,6 +60,8 @@ class _LogFormatter(logging.Formatter):
 def pretty_logging(log_file_path, log_level):
     """Turns on formatted logging output as configured."""
     root_logger = logging.getLogger()
+    for h in root_logger.handlers:
+        root_logger.removeHandler(h)
     root_logger.setLevel(getattr(logging, log_level.upper()))
     if log_file_path:
         channel = logging.handlers.TimedRotatingFileHandler(
